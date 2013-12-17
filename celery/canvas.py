@@ -473,13 +473,36 @@ class group(Signature):
                 task['args'] = task._merge(d['args'])[0]
         return group(tasks, app=app, **kwdict(d['options']))
 
-    def apply_async(self, args=(), kwargs=None, **options):
+    def _maybe_freeze_group_id(self, options):
+        group_id = options.get('group_id')
+        if group_id is None:
+            group_id = options['group_id'] = uuid()
+        return group_id
+
+    def itercall(self, options, producer=None, add_to_parent=True):
+        group_id = self._maybe_freeze_group_id(options)
+        with self.app.producer_or_acquire(producer) as producer:
+            for task in self.tasks:
+                task = maybe_signature(task, app=self.app)
+                task.options['group_id'] = group_id
+                result = task.freeze()
+                task.apply_async(group_id=group_id, producer=producer,
+                                 add_to_parent=add_to_parent)
+                yield result
+
+    def apply_async(self, args=(), kwargs=None, **opts):
         tasks = _maybe_clone(self.tasks, app=self._app)
         if not tasks:
             return self.freeze()
-        type = self.type
-        return type(*type.prepare(dict(self.options, **options),
-                                  tasks, args))
+        options = dict(self.options, **opts) if opts else self.options
+        result = self.app.GroupResult(
+            self._maybe_freeze_group_id(options),
+            list(self.itercall(options, add_to_parent=False)),
+        )
+        parent = get_current_worker_task()
+        if parent:
+            parent.add_trail(result)
+        return result
 
     def set_immutable(self, immutable):
         for task in self.tasks:
@@ -531,13 +554,7 @@ class group(Signature):
 
     @property
     def type(self):
-        if self._type:
-            return self._type
-        # taking the app from the first task in the list, there may be a
-        # better solution for this, e.g. to consolidate tasks with the same
-        # app and apply them in batches.
-        app = self._app if self._app else self.tasks[0].type.app
-        return app.tasks[self['task']]
+        return
 
 
 @Signature.register_type
